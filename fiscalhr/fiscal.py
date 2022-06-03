@@ -2,23 +2,19 @@
 
 '''Helper class for fiscalization in Croatia'''
 
-from __future__ import absolute_import
-
 import re
 from uuid import uuid4
 from hashlib import md5
 from datetime import datetime
+from http import client
+from urllib import request
 
 import ssl
-import httplib
-import urllib2
-from backports.ssl_match_hostname import match_hostname
+from zoneinfo import ZoneInfo
 
-from pytz import timezone
 from pkg_resources import resource_filename
-
 from OpenSSL import crypto
-from xmldsig import XMLDSIG
+from signxml import XMLSigner, XMLVerifier
 
 from suds.client import Client
 from suds.sax.parser import Parser
@@ -72,6 +68,7 @@ class Fiscal():
             wsdl_location = 'file://'
             wsdl_location += resource_filename(__name__,
                 resource_path + 'wsdl/FiskalizacijaService.wsdl')
+            print(wsdl_location)
 
         xmldsig_plugin = XmlDSigMessagePlugin(key_path, cert_path,
                                               key_passphrase=key_passphrase,
@@ -159,7 +156,7 @@ class Fiscal():
     def generate_header(self):
         '''Generate header for Fiskal CIS request'''
 
-        zaglavlje = self.create('Zaglavlje')
+        zaglavlje = self.create('ZaglavljeType')
         zaglavlje.IdPoruke = uuid4()
         zaglavlje.DatumVrijeme = self.format_time()
         return zaglavlje
@@ -211,7 +208,7 @@ class Fiscal():
         '''Generates receipt signature (ZKI)'''
 
         zki_data = self.get_zki_data(racun)
-        zki_data = ''.join(zki_data)
+        zki_data = ''.join(zki_data).encode('utf-8')
         zki = self.generate_sha1_rsa_md5_signature(zki_data)
         return zki
 
@@ -222,7 +219,7 @@ class Fiscal():
 
         if self.key_passphrase:
             pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, key_pem,
-                                          self.key_passphrase)
+                                          self.key_passphrase.encode('utf8'))
         else:
             pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, key_pem)
 
@@ -235,10 +232,10 @@ class Fiscal():
     def localtime_now(cls):
         '''Return the current local date and time in Croatia'''
 
-        return datetime.now(timezone('Europe/Zagreb'))
+        return datetime.now(ZoneInfo('Europe/Zagreb'))
 
     @classmethod
-    def format_time(cls, local_time=None, type_name='DatumVrijeme'):
+    def format_time(cls, local_time:datetime = None, type_name='DatumVrijeme'):
         '''Returns local date and time in requested format'''
 
         time_format = cls.get_time_format(type_name)
@@ -246,9 +243,9 @@ class Fiscal():
         if local_time is None:
             local_time = cls.localtime_now()
         elif not local_time.tzinfo:
-            local_time = timezone('Europe/Zagreb').localize(local_time)
+            local_time = local_time.replace(tzinfo=ZoneInfo('Europe/Zagreb'))
         else:
-            local_time = local_time.astimezone(timezone('Europe/Zagreb'))
+            local_time = local_time.astimezone(ZoneInfo('Europe/Zagreb'))
 
         return local_time.strftime(time_format)
 
@@ -333,18 +330,23 @@ class XmlDSigMessagePlugin(MessagePlugin):
         payload.set('Id', reference_id)
         signature_template %= {'REFERENCE_ID': reference_id}
 
-        signature_element = Parser().parse(string=signature_template).root()
+        signature_element = Parser().parse(string=signature_template.encode('utf-8')).root()
         payload.append(signature_element)
 
         envelope = self.DTD_TEST_ID % qname
         envelope += envelope_element.str()
         envelope = envelope.encode('utf-8')
+        # print(envelope)
 
-        signer = XMLDSIG()
-        signer.load_key(self.key_path,
-                        password=self.key_passphrase,
-                        cert_path=self.cert_path)
-        context.envelope = signer.sign(envelope)
+        signer = XMLSigner()
+        cert = open(self.cert_path).read()
+        key = open(self.key_path).read()
+        # signer.load_key(self.key_path,
+        #                 password=self.key_passphrase,
+        #                 cert_path=self.cert_path)
+        context.envelope = signer.sign(
+            envelope, key=key, cert=cert, passphrase=self.key_passphrase
+        )
         context.envelope = self.RE_DTD_TEST.sub('', context.envelope)
 
     def received(self, context):
@@ -408,8 +410,7 @@ class XmlDSigMessagePlugin(MessagePlugin):
             reply = self.DTD_TEST_ID % qname
             reply += self.RE_XML_HEADER.sub('', context.reply)
 
-            verifier = XMLDSIG()
-            verifier.load_certs(self.cis_ca_paths)
+            verifier = XMLVerifier()
             valid_signature = verifier.verify(reply)
 
         except Exception as exc:
@@ -445,7 +446,7 @@ class CustomHttpTransport(HttpTransport):
         return handlers
 
 
-class CustomHTTPErrorProcessor(urllib2.BaseHandler):
+class CustomHTTPErrorProcessor(request.BaseHandler):
     '''
     Error processor for urllib2 which returns response data (i.e. does not
     raise exception) on HTTP error code 500 (Internal Server Error) because
@@ -458,19 +459,19 @@ class CustomHTTPErrorProcessor(urllib2.BaseHandler):
         return response
 
 
-class CertValidatingHTTPSConnection(httplib.HTTPConnection):
+class CertValidatingHTTPSConnection(client.HTTPConnection):
     '''
     HTTP connection class with SSL hostname verification
 
     https://gist.github.com/schlamar/2993700
     '''
 
-    default_port = httplib.HTTPS_PORT
+    default_port = client.HTTPS_PORT
 
     def __init__(self, host, port=None, key_file=None, cert_file=None,
                  ca_certs=None, strict=None, **kwargs):
 
-        httplib.HTTPConnection.__init__(self, host, port, strict, **kwargs)
+        client.HTTPConnection.__init__(self, host, port, strict, **kwargs)
         self.key_file = key_file
         self.cert_file = cert_file
         self.ca_certs = ca_certs
@@ -480,7 +481,7 @@ class CertValidatingHTTPSConnection(httplib.HTTPConnection):
             self.cert_reqs = ssl.CERT_NONE
 
     def connect(self):
-        httplib.HTTPConnection.connect(self)
+        client.HTTPConnection.connect(self)
         self.sock = ssl.wrap_socket(self.sock, keyfile=self.key_file,
                                     certfile=self.cert_file,
                                     cert_reqs=self.cert_reqs,
@@ -491,18 +492,18 @@ class CertValidatingHTTPSConnection(httplib.HTTPConnection):
             # Fix for invalid subjectAltName in cis.porezna-uprava.hr certificate
             if 'subjectAltName' in cert:
                 del cert['subjectAltName']
-            match_hostname(cert, hostname)
+            ssl.match_hostname(cert, hostname)
 
 
-class VerifiedHTTPSHandler(urllib2.HTTPSHandler):
+class VerifiedHTTPSHandler(request.HTTPSHandler):
     '''
-    urllib2 handler class which verifies SSL hostname
+    urllib handler class which verifies SSL hostname
 
     https://gist.github.com/schlamar/2993700
     '''
 
     def __init__(self, **kwargs):
-        urllib2.HTTPSHandler.__init__(self)
+        request.HTTPSHandler.__init__(self)
         self._connection_args = kwargs
 
     def https_open(self, req):
@@ -525,8 +526,8 @@ class XmlMessageLogPlugin(MessagePlugin):
 
     def sending(self, context):
         if self.sending_log_callback:
-            self.sending_log_callback(unicode(context.envelope))
+            self.sending_log_callback(context.envelope)
 
     def received(self, context):
         if self.received_log_callback:
-            self.received_log_callback(unicode(context.reply))
+            self.received_log_callback(context.reply)
